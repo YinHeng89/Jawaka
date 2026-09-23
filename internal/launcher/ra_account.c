@@ -38,11 +38,24 @@ static int jw__ra_read_file(const char *path, char *out, size_t out_size) {
    one trailing newline. No versions, no flags: support is advertised by the
    payload carrying the record at all, inside a target directory whose
    ownership this function's caller already established. */
-static bool jw__ra_capability_matches(const char *content) {
-    static const char id[] = JW_RA_ACCOUNT_CONTRACT_ID;
+static bool jw__ra_capability_matches(const char *content, const char *id) {
     size_t len = strlen(content);
+    size_t id_len = strlen(id);
     if (len > 0 && content[len - 1] == '\n') len--;
-    return len == sizeof(id) - 1 && memcmp(content, id, sizeof(id) - 1) == 0;
+    return len == id_len && memcmp(content, id, id_len) == 0;
+}
+
+/* <platform_dir>/emulators/flycast/<name> holds exactly id. */
+static bool jw__ra_flycast_record_matches(const char *platform_dir,
+                                          const char *name, const char *id) {
+    char path[1024];
+    char content[64];
+    if (snprintf(path, sizeof(path), "%s/emulators/flycast/%s", platform_dir,
+                 name) >= (int)sizeof(path)) {
+        return false;
+    }
+    return jw__ra_read_file(path, content, sizeof(content)) == 0 &&
+           jw__ra_capability_matches(content, id);
 }
 
 /* DSperate's account adapter first shipped in pak 2.1.1. Older installed
@@ -107,19 +120,14 @@ bool jw_ra_account_target_authorized(const char *launcher_path,
     if (!policy->provider_bound &&
         policy->release == JW_STANDALONE_RELEASE_FLYCAST) {
         char expected[1024];
-        char marker[1024];
         if (snprintf(expected, sizeof(expected),
                      "%s/emulators/flycast/launch.sh", platform_dir) >=
                 (int)sizeof(expected) ||
-            strcmp(launcher_path, expected) != 0 ||
-            snprintf(marker, sizeof(marker),
-                     "%s/emulators/flycast/ra-account-v1", platform_dir) >=
-                (int)sizeof(marker)) {
+            strcmp(launcher_path, expected) != 0) {
             return false;
         }
-        char capability[64];
-        return jw__ra_read_file(marker, capability, sizeof(capability)) == 0 &&
-               jw__ra_capability_matches(capability);
+        return jw__ra_flycast_record_matches(platform_dir, "ra-account-v1",
+                                             JW_RA_ACCOUNT_CONTRACT_ID);
     }
 
     if (policy->provider_bound && provider &&
@@ -135,4 +143,25 @@ bool jw_ra_account_target_authorized(const char *launcher_path,
     }
 
     return false;
+}
+
+bool jw_flycast_ra_route_target_authorized(const char *launcher_path,
+                                           const char *core_id,
+                                           const jw_standalone_policy *policy,
+                                           const char *provider,
+                                           const char *platform_dir) {
+    /* The account authorization already pins the exact release-owned
+       launcher; repeating the release check here keeps DSperate, which is
+       also account-authorized, out of the route. */
+    return policy && !policy->provider_bound &&
+           policy->release == JW_STANDALONE_RELEASE_FLYCAST &&
+           jw_ra_account_target_authorized(launcher_path, core_id, policy,
+                                           provider, platform_dir) &&
+           jw__ra_flycast_record_matches(platform_dir, "ra-route-v1",
+                                         JW_FLYCAST_RA_ROUTE_CAPABILITY_ID);
+}
+
+const char *jw_flycast_ra_route_value(bool service_live) {
+    return service_live ? JW_FLYCAST_RA_ROUTE_SERVICE_LIVE
+                        : JW_FLYCAST_RA_ROUTE_NATIVE;
 }
