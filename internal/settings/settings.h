@@ -459,6 +459,7 @@ typedef struct {
     unsigned           wifi_msg_ms;         /* when wifi_msg was set (0 = none); auto-expires */
     char               wifi_attempt_ssid[64];  /* network we're trying to join ("" = none) */
     unsigned           wifi_attempt_ms;     /* when the join attempt started */
+    int                wifi_attempt_auth_fails; /* auth-fail events seen this attempt */
     int                wifi_monitor_fd;     /* wpa event-socket fd during a join (-1 = none) */
     bool               wifi_radio_on;       /* Wi-Fi on/off toggle state */
     int                wifi_strength_cached;/* 0..3 for the status-bar icon; polled on a throttle */
@@ -511,13 +512,15 @@ bool jw_settings_tab_glide(const jw_settings_ui *ui);
    the UI never sees them). The launcher hands this to its BACKGROUND poller and
    applies the result with jw_settings_ui_apply_av(); it must not be sampled on
    the render thread, because a round trip to jawakad costs ~110ms of latency and
-   this page needs several.
+   this page needs several. Pass -1 for a level and NULL for the audio status
+   when that half was not sampled.
 
    jw_settings_ui_refresh_av() is the blocking one-shot, still fine on page open
    where a single stall is invisible, but never in a loop. */
 bool jw_settings_ui_wants_av_poll(const jw_settings_ui *ui);
 void jw_settings_ui_refresh_av(jw_settings_ui *ui);
 void jw_settings_ui_apply_av(jw_settings_ui *ui, int brightness_percent,
+                             int volume_percent,
                              const jw_ipc_audio_status *audio);
 
 /* True while the Network page is open. The launcher calls

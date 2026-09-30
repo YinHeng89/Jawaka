@@ -233,7 +233,6 @@ typedef struct {
 } jw_perf_option;
 
 static const jw_platform_perf_profile kInGamePerfProfiles[] = {
-    JW_PLATFORM_PERF_PROFILE_AUTO,
     JW_PLATFORM_PERF_PROFILE_BALANCED,
     JW_PLATFORM_PERF_PROFILE_PERFORMANCE,
     JW_PLATFORM_PERF_PROFILE_BATTERY_SAVER,
@@ -918,9 +917,15 @@ static void jw__ingame_perf_sync_indices(jw_ingame_state *state) {
     if (!state || !state->perf_ready) {
         return;
     }
-    state->perf_profile_index = jw__ingame_perf_profile_index(
-        state->perf.session_override ? state->perf.session_profile
-                                     : state->perf.global_profile);
+    const char *shown = state->perf.session_override
+        ? state->perf.session_profile : state->perf.active_profile;
+    jw_platform_perf_profile parsed;
+    if (jw_platform_parse_perf_profile(shown, &parsed) &&
+        parsed == JW_PLATFORM_PERF_PROFILE_AUTO &&
+        state->perf.active_profile[0]) {
+        shown = state->perf.active_profile;
+    }
+    state->perf_profile_index = jw__ingame_perf_profile_index(shown);
     state->perf_cpu_index = jw__ingame_perf_match_option(
         &state->perf.domains[JW_PLATFORM_PERF_DOMAIN_CPU],
         kCpuPerfOptions, JW_CPU_PERF_OPTION_COUNT);
@@ -2103,7 +2108,7 @@ static void jw__render_ingame_shader(const jw_ingame_state *state,
                matrix asks the user to see when one is present. */
             for (size_t i = 0; i < selected->constraint_count; i++) {
                 if (strstr(selected->constraints[i], "BFI")) {
-                    constraint = selected->constraints[i];
+                    constraint = T(selected->constraints[i]);
                     break;
                 }
             }
@@ -3057,7 +3062,8 @@ static void jw__menu_host_setting(const char *socket_path, jw_menu_state *menu,
             }
         }
         if (!running) break;
-        if (jw_settings_ui_screen(ui) == JW_SETTINGS_UPDATE)
+        if (jw_settings_ui_screen(ui) == JW_SETTINGS_UPDATE ||
+            jw_settings_ui_screen(ui) == JW_SETTINGS_UPDATE_PICKER)
             jw_settings_ui_refresh_update(ui);
         jw__render_hosted(menu, ui);
     }

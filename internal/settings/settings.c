@@ -622,6 +622,7 @@ static void jw__refresh_audio_status(jw_settings_ui *ui) {
    (almost none of it work), and this page used to make four of them in a row
    every 300ms, which is what made its cursor movement drag. */
 void jw_settings_ui_apply_av(jw_settings_ui *ui, int brightness_percent,
+                             int volume_percent,
                              const jw_ipc_audio_status *audio) {
     if (!ui) return;
     if (brightness_percent >= 0) {
@@ -629,6 +630,12 @@ void jw_settings_ui_apply_av(jw_settings_ui *ui, int brightness_percent,
     }
     if (audio) {
         jw__apply_audio_status(ui, audio);
+    }
+    /* After the audio status, which also carries a volume: the poller samples
+       the levels every pass but the audio status only every few, so this is the
+       fresher of the two. */
+    if (volume_percent >= 0) {
+        ui->volume_percent = volume_percent > 100 ? 100 : volume_percent;
     }
 }
 
@@ -739,71 +746,50 @@ static void jw__refresh_boot_splash(jw_settings_ui *ui) {
     }
 }
 
-static void jw__refresh_refresh_rate(jw_settings_ui *ui) {
+/* Refresh Rate, Color Temperature and HDMI Output all come from platform-status,
+   which costs jawakad several process spawns to answer, so fetch it once for the
+   three rows rather than once per row on every page open. */
+static void jw__refresh_display_modes(jw_settings_ui *ui) {
     if (!ui) {
         return;
     }
     ui->refresh_rate_supported = false;
-    if (!ui->socket_path[0]) {
-        return;
-    }
-
-    int hz = -1;
-    bool supported = false;
-    if (jw_ipc_get_refresh_rate(ui->socket_path, &hz, &supported) == 0) {
-        ui->refresh_rate_supported = supported;
-        /* Reflect the panel's actual current rate when the daemon reports it
-           (truth over the persisted mirror, e.g. after moving the card). Any
-           positive rate is taken as-is rather than filtered against the offered
-           list: the live mode IS the truth, so a panel left at a retired rate
-           (90 Hz, from before it left the menu) must read 90 rather than have
-           the row quietly claim 60. Cycling off it then retires it for good. */
-        if (hz > 0) {
-            ui->refresh_rate_hz = hz;
-        }
-    }
-}
-
-static void jw__refresh_color_temp(jw_settings_ui *ui) {
-    if (!ui) {
-        return;
-    }
     ui->color_temp_supported = false;
-    if (!ui->socket_path[0]) {
-        return;
-    }
-
-    int kelvin = -1;
-    bool supported = false;
-    if (jw_ipc_get_color_temp(ui->socket_path, &kelvin, &supported) == 0) {
-        ui->color_temp_supported = supported;
-        /* The daemon only knows a value once one has been applied this boot; a
-           negative reading means "not set yet", so keep the persisted mirror. */
-        if (kelvin > 0) {
-            ui->color_temp_kelvin = jw_platform_clamp_color_temp_k(kelvin);
-        }
-    }
-}
-
-static void jw__refresh_hdmi(jw_settings_ui *ui) {
-    if (!ui) {
-        return;
-    }
     ui->hdmi_supported = false;
     ui->hdmi_connected = -1;
     if (!ui->socket_path[0]) {
         return;
     }
-    int connected = -1, mode = -1;
-    bool supported = false;
-    if (jw_ipc_get_hdmi_status(ui->socket_path, &connected, &mode, &supported) == 0) {
-        ui->hdmi_supported = supported;
-        ui->hdmi_connected = connected;
-        /* The persisted setting is the source of truth for the chosen mode; only
-           adopt the daemon's live mode when it actually has one applied. */
-        if (mode >= 0 && mode <= 2) {
-            ui->hdmi_output_mode = mode;
-        }
+
+    jw_ipc_display_status status;
+    if (jw_ipc_get_display_status(ui->socket_path, &status) != 0) {
+        return;
+    }
+
+    ui->refresh_rate_supported = status.refresh_rate_supported;
+    /* Reflect the panel's actual current rate when the daemon reports it
+       (truth over the persisted mirror, e.g. after moving the card). Any
+       positive rate is taken as-is rather than filtered against the offered
+       list: the live mode IS the truth, so a panel left at a retired rate
+       (90 Hz, from before it left the menu) must read 90 rather than have
+       the row quietly claim 60. Cycling off it then retires it for good. */
+    if (status.refresh_rate_hz > 0) {
+        ui->refresh_rate_hz = status.refresh_rate_hz;
+    }
+
+    ui->color_temp_supported = status.color_temp_supported;
+    /* The daemon only knows a value once one has been applied this boot; a
+       negative reading means "not set yet", so keep the persisted mirror. */
+    if (status.color_temp_kelvin > 0) {
+        ui->color_temp_kelvin = jw_platform_clamp_color_temp_k(status.color_temp_kelvin);
+    }
+
+    ui->hdmi_supported = status.hdmi_supported;
+    ui->hdmi_connected = status.hdmi_connected;
+    /* The persisted setting is the source of truth for the chosen mode; only
+       adopt the daemon's live mode when it actually has one applied. */
+    if (status.hdmi_output_mode >= 0 && status.hdmi_output_mode <= 2) {
+        ui->hdmi_output_mode = status.hdmi_output_mode;
     }
 }
 
@@ -869,8 +855,15 @@ static void jw__refresh_update_status(jw_settings_ui *ui, bool quiet) {
 }
 
 bool jw_settings_ui_wants_update_poll(const jw_settings_ui *ui) {
-    return ui && ui->open && ui->screen == JW_SETTINGS_UPDATE &&
-           (ui->update.download_active || ui->update.install_active);
+    if (!ui || !ui->open) {
+        return false;
+    }
+    if (ui->screen == JW_SETTINGS_UPDATE_PICKER) {
+        return ui->update.options_loading;
+    }
+    return ui->screen == JW_SETTINGS_UPDATE &&
+           (ui->update.download_active || ui->update.install_active ||
+            (ui->update_have_status && strcmp(ui->update.state, "checking") == 0));
 }
 
 void jw_settings_ui_refresh_update(jw_settings_ui *ui) {
@@ -2004,6 +1997,15 @@ void jw_settings_ui_refresh_wifi_strength(jw_settings_ui *ui) {
 }
 
 int jw_settings_bt_state_now(void) {
+    /* The status bar polls this every few seconds. The kernel answers without
+       the bluetoothctl calls, the sqlite3 read and the saved-list sync that
+       jw_bt_radio_is_on() runs; the Bluetooth page still does all of that. */
+    bool powered = false;
+    bool connected = false;
+    if (jw_bt_kernel_state(&powered, &connected) == 0) {
+        if (!powered) return 0;
+        return connected ? 2 : 1;
+    }
     if (!jw_bt_radio_is_on()) return 0;
     return (jw_bt_any_connected() == 1) ? 2 : 1;
 }
@@ -3082,6 +3084,7 @@ static void jw__wifi_msg(jw_settings_ui *ui, const char *fmt, ...) {
 static void jw__wifi_attempt_begin(jw_settings_ui *ui, const char *ssid) {
     snprintf(ui->wifi_attempt_ssid, sizeof(ui->wifi_attempt_ssid), "%s", ssid);
     ui->wifi_attempt_ms = SDL_GetTicks();
+    ui->wifi_attempt_auth_fails = 0;
     if (ui->wifi_monitor_fd >= 0) {
         jw_wifi_monitor_close(ui->wifi_monitor_fd);
     }
@@ -3145,7 +3148,9 @@ void jw_settings_ui_refresh_wifi(jw_settings_ui *ui) {
     /* Resolve a pending connect attempt:
        - success: associated (COMPLETED) on the target SSID;
        - WRONG_KEY event: definitive wrong password;
-       - auth-fail event (SAE/WPA3 bad key, assoc reject): likely wrong password;
+       - a second auth-fail event (SAE/WPA3 bad key, assoc reject): likely wrong
+         password. A single one is often one access point refusing while
+         wpa_supplicant gets in through another (jw_wifi_attempt_resolve);
        - timeout (12s): neither.
        On any failure, forget the bad profile and recover the prior network — a
        connect uses select_network, which disabled it. The monitor is closed on
@@ -3153,14 +3158,15 @@ void jw_settings_ui_refresh_wifi(jw_settings_ui *ui) {
     if (ui->wifi_attempt_ssid[0]) {
         bool connected = ui->wifi.connected &&
                          strcmp(ui->wifi.ssid, ui->wifi_attempt_ssid) == 0;
-        bool failed = (evt != JW_WIFI_EVT_NONE) ||
-                      (int)(now - ui->wifi_attempt_ms) > 12000;
-        if (connected) {
+        jw_wifi_attempt_result result =
+            jw_wifi_attempt_resolve(connected, evt, &ui->wifi_attempt_auth_fails,
+                                    now - ui->wifi_attempt_ms);
+        if (result == JW_WIFI_ATTEMPT_CONNECTED) {
             jw__wifi_msg(ui, "Connected to %s",
                      ui->wifi_attempt_ssid);
             jw__wifi_attempt_clear(ui);
-        } else if (failed) {
-            if (evt == JW_WIFI_EVT_WRONG_KEY) {
+        } else if (result != JW_WIFI_ATTEMPT_PENDING) {
+            if (result == JW_WIFI_ATTEMPT_WRONG_KEY) {
                 /* Only a DEFINITIVE wrong key forgets the profile — never a
                    generic/timeout failure, which on this flaky radio can hit a
                    perfectly-good saved network and would otherwise destroy a
@@ -5865,14 +5871,28 @@ static void jw__render_update_picker(const jw_settings_ui *ui,
         count = JW_IPC_UPDATE_MAX_OPTIONS;
     }
 
-    const char *message = count > 0
-        ? "Compatible releases"
-        : "Check releases first";
+    bool loading = ui && ui->update.options_loading;
+    const char *message = "Compatible releases";
+    if (loading) {
+        message = "Loading releases...";
+    } else if (count <= 0) {
+        message = "Check releases first";
+    } else if (!ui->update.options_complete && ui->update.message[0]) {
+        message = ui->update.message;   /* the list load failed; say why */
+    }
     cat_draw_text_ellipsized(small, message, x + cat_scale(12), dy,
                              theme->hint, w - cat_scale(24));
     dy += TTF_FontHeight(small) + cat_scale(8);
 
-    if (count > 0) {
+    if (loading) {
+        jw__draw_update_activity(ui, x + cat_scale(12), dy,
+                                 w - cat_scale(24));
+        dy += cat_scale(12);
+        /* Keep the loop drawing so the bar animates and the status poll keeps
+           running; otherwise the loop idles until a button press and the list
+           never appears. */
+        cat_request_frame();
+    } else if (count > 0) {
         int item_h = TTF_FontHeight(cat_get_font(CAT_FONT_MEDIUM)) +
                      TTF_FontHeight(small) + cat_scale(16);
         cat_box lb = { x, dy, w, h - (dy - y), 0, 0, 0, 0 };
@@ -6458,17 +6478,47 @@ static bool jw__confirm_update_picker_choice(const jw_settings_ui *ui,
     return jw__confirmation(&opts, &result) == CAT_OK && result.confirmed;
 }
 
+/* Ask the daemon for every release in the list; the routine check only reads
+   the newest. It answers at once and loads in the background. */
+static void jw__update_load_releases(jw_settings_ui *ui,
+                                     bool refresh,
+                                     char *status_buf,
+                                     size_t status_size) {
+    if (!ui || !ui->socket_path[0]) {
+        jw__copy_status(status_buf, status_size, "Update service unavailable");
+        if (ui) jw__update_msg(ui, "Update service unavailable");
+        return;
+    }
+
+    jw_ipc_update_status_info info;
+    memset(&info, 0, sizeof(info));
+    char status[192] = { 0 };
+    if (jw_ipc_update_releases(ui->socket_path, refresh, &info,
+                               status, sizeof(status)) == 0) {
+        jw__settings_update_from_ipc(ui, &info, NULL);
+        /* Opening the picker asks from the update page, which would schedule
+           its slow 3 s poll; the list usually lands well before that. */
+        if (info.options_loading) {
+            ui->update_next_poll_ms = SDL_GetTicks() + 500;
+        }
+    } else {
+        jw__copy_status(status_buf, status_size,
+                        status[0] ? status : "Cannot load releases");
+        jw__update_msg(ui, "%s", status[0] ? status : "Cannot load releases");
+    }
+}
+
 static void jw__open_update_picker(jw_settings_ui *ui,
                                    char *status_buf,
                                    size_t status_size) {
     if (!ui) {
         return;
     }
-    if (jw__update_option_count(ui) <= 0) {
-        jw__update_check_releases(ui, status_buf, status_size);
+    if (!ui->update.options_complete) {
+        jw__update_load_releases(ui, false, status_buf, status_size);
     }
     int count = jw__update_option_count(ui);
-    if (count <= 0) {
+    if (count <= 0 && !ui->update.options_loading) {
         jw__copy_status(status_buf, status_size,
                         ui->update_msg[0] ? ui->update_msg : "No releases available");
         return;
@@ -6489,6 +6539,11 @@ static void jw__select_update_picker_choice(jw_settings_ui *ui,
     if (!ui || !ui->socket_path[0]) {
         jw__copy_status(status_buf, status_size, "Update service unavailable");
         if (ui) jw__update_msg(ui, "Update service unavailable");
+        return;
+    }
+
+    if (ui->update.options_loading) {
+        jw__copy_status(status_buf, status_size, "Releases are still loading");
         return;
     }
 
@@ -6538,7 +6593,12 @@ static void jw__update_check_releases(jw_settings_ui *ui,
     char status[192] = { 0 };
     if (jw_ipc_update_check(ui->socket_path, NULL, &info,
                             status, sizeof(status)) == 0) {
-        jw__settings_update_from_ipc(ui, &info, status);
+        /* While the check runs, the daemon's own message says so and turns into
+           the result when it lands. A transient copy of "Checking for updates"
+           would outlive a fast check: the page stops redrawing once the result
+           is in, so the message never gets to expire. */
+        bool checking = strcmp(info.state, "checking") == 0;
+        jw__settings_update_from_ipc(ui, &info, checking ? NULL : status);
         jw__copy_status(status_buf, status_size, status);
     } else {
         jw__settings_update_from_ipc(ui, &info,
@@ -6889,7 +6949,8 @@ static void jw__cycle_update_channel(jw_settings_ui *ui, char *status_buf,
        uninstalled download would be discarded by the re-check the switch kicks
        off (jw__clear_candidate clears downloaded/download_path). */
     bool checking = ui->update_have_status &&
-                    strcmp(ui->update.state, "checking") == 0;
+                    (strcmp(ui->update.state, "checking") == 0 ||
+                     ui->update.options_loading);
     if (checking || ui->update.download_active || ui->update.install_active ||
         ui->update.install_armed || ui->update.downloaded) {
         jw__copy_status(status_buf, status_size,
@@ -6947,9 +7008,7 @@ static bool jw__enter_screen(jw_settings_ui *ui, jw_settings_screen screen,
         jw__refresh_brightness(ui);
         jw__refresh_volume(ui);
         jw__refresh_audio_status(ui);
-        jw__refresh_refresh_rate(ui);
-        jw__refresh_color_temp(ui);
-        jw__refresh_hdmi(ui);
+        jw__refresh_display_modes(ui);
         break;
     case JW_SETTINGS_LIGHTING:
         jw__refresh_led(ui);
@@ -8399,7 +8458,7 @@ static bool jw__settings_handle_button_inner(jw_settings_ui *ui, cat_button butt
                 jw__select_update_picker_choice(ui, status_buf, status_size);
                 break;
             case CAT_BTN_X:
-                jw__update_check_releases(ui, status_buf, status_size);
+                jw__update_load_releases(ui, true, status_buf, status_size);
                 break;
             case CAT_BTN_B:
                 ui->screen = JW_SETTINGS_UPDATE;
